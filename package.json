@@ -1,1 +1,11 @@
-404: Not Found
+{
+  "name": "pyutils-mb",
+  "version": "1.0.0",
+  "description": "Crazy Tower game + tests",
+  "scripts": {
+    "test": "jest --verbose"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
+  }
+}

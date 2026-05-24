@@ -1,1 +1,512 @@
-404: Not Found
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Crazy Tower</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #07071a;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      font-family: 'Arial Black', Arial, sans-serif;
+      overflow: hidden;
+      touch-action: manipulation;
+    }
+
+    #hud {
+      color: #fff;
+      text-align: center;
+      margin-bottom: 10px;
+      line-height: 1.2;
+    }
+    #score-display {
+      font-size: 3rem;
+      font-weight: 900;
+      letter-spacing: 4px;
+      text-shadow: 0 0 20px rgba(140, 100, 255, 0.8);
+    }
+    #level-display {
+      font-size: 0.85rem;
+      letter-spacing: 2px;
+      color: #7777aa;
+    }
+    #progress-bar {
+      width: 200px;
+      height: 5px;
+      background: rgba(255,255,255,0.1);
+      border-radius: 3px;
+      margin: 6px auto 0;
+      overflow: hidden;
+    }
+    #progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #7c3aed, #db2777);
+      border-radius: 3px;
+      transition: width 0.3s ease;
+    }
+
+    #game-wrap {
+      position: relative;
+    }
+    #canvas {
+      display: block;
+      border-radius: 14px;
+      box-shadow: 0 0 60px rgba(100, 80, 255, 0.25);
+    }
+    #overlay {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      pointer-events: none;
+    }
+    #banner {
+      color: #fff;
+      font-size: 2rem;
+      font-weight: 900;
+      text-align: center;
+      line-height: 1.5;
+      text-shadow: 0 0 30px currentColor;
+      opacity: 0;
+      transform: scale(0.75);
+      transition: opacity 0.25s ease, transform 0.25s ease;
+    }
+    #banner.show {
+      opacity: 1;
+      transform: scale(1);
+    }
+
+    #stack-btn {
+      margin-top: 16px;
+      padding: 17px 64px;
+      font-family: inherit;
+      font-size: 1.35rem;
+      font-weight: 900;
+      letter-spacing: 3px;
+      background: linear-gradient(135deg, #7c3aed 0%, #db2777 100%);
+      color: #fff;
+      border: none;
+      border-radius: 50px;
+      cursor: pointer;
+      box-shadow: 0 5px 25px rgba(139, 40, 200, 0.55);
+      transition: transform 0.08s, box-shadow 0.08s;
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    #stack-btn:active {
+      transform: scale(0.91);
+      box-shadow: 0 2px 12px rgba(139, 40, 200, 0.4);
+    }
+
+    #hint {
+      margin-top: 8px;
+      font-size: 0.72rem;
+      color: #44445a;
+      letter-spacing: 1px;
+    }
+  </style>
+</head>
+<body>
+
+<div id="hud">
+  <div id="score-display">0</div>
+  <div id="level-display">LEVEL 1 / 50</div>
+  <div id="progress-bar"><div id="progress-fill" style="width:2%"></div></div>
+</div>
+
+<div id="game-wrap">
+  <canvas id="canvas" width="420" height="520"></canvas>
+  <div id="overlay"><div id="banner"></div></div>
+</div>
+
+<button id="stack-btn">▶ START</button>
+<div id="hint">SPACE / ENTER / TAP</div>
+
+<script>
+// ─── Constants ───────────────────────────────────────────────────────────────
+const MAX_LEVELS    = 50;
+const CW            = 420;
+const CH            = 520;
+const BASE_Y        = CH - 72;   // screen-Y of base block's front-face top edge
+const BLOCK_STEP    = 46;        // screen pixels between consecutive block levels
+const BFH           = 28;        // block front-face height (px)
+const ISO_DX        = 20;        // isometric x-depth (right-facing)
+const ISO_DY        = 11;        // isometric y-depth (upward)
+const INITIAL_WIDTH = 186;       // starting block width in game-space px
+const PERFECT_ZONE  = 4;         // ±px for a "perfect" stack (keeps width)
+
+// ─── DOM refs ────────────────────────────────────────────────────────────────
+const canvas      = document.getElementById('canvas');
+const ctx         = canvas.getContext('2d');
+const scoreEl     = document.getElementById('score-display');
+const levelEl     = document.getElementById('level-display');
+const progressEl  = document.getElementById('progress-fill');
+const banner      = document.getElementById('banner');
+const btn         = document.getElementById('stack-btn');
+
+// ─── Game state ──────────────────────────────────────────────────────────────
+let gameState  = 'idle';   // idle | play | over | win
+let score      = 0;
+let blocks     = [];       // [{gx, width}] — gx is left-edge offset from screen center
+let moving     = null;     // {gx, width, dir, speed}
+let camY       = 0;        // current smooth-camera offset
+let camYTarget = 0;        // target camera offset
+let particles  = [];
+let flashAlpha = 0;
+let animId     = null;
+
+// ─── Color helpers ───────────────────────────────────────────────────────────
+function blockHue(level) {
+  return (level * 19 + 195) % 360;
+}
+function blockColors(level) {
+  const h = blockHue(level);
+  return {
+    top:   `hsl(${h},85%,70%)`,
+    front: `hsl(${h},80%,54%)`,
+    side:  `hsl(${h},80%,34%)`,
+    raw:   h,
+  };
+}
+
+// ─── Projection helpers ──────────────────────────────────────────────────────
+function screenX(gx)  { return CW / 2 + gx; }
+function screenY(idx) { return BASE_Y - idx * BLOCK_STEP + camY; }
+
+// ─── Draw one 3-D block ──────────────────────────────────────────────────────
+function drawBlock3D(gx, width, idx, colors) {
+  if (width <= 0) return;
+  const sx = screenX(gx);
+  const sy = screenY(idx);
+
+  // front face
+  ctx.fillStyle = colors.front;
+  ctx.fillRect(sx, sy, width, BFH);
+
+  // top face
+  ctx.fillStyle = colors.top;
+  ctx.beginPath();
+  ctx.moveTo(sx,             sy);
+  ctx.lineTo(sx + ISO_DX,    sy - ISO_DY);
+  ctx.lineTo(sx + width + ISO_DX, sy - ISO_DY);
+  ctx.lineTo(sx + width,     sy);
+  ctx.closePath();
+  ctx.fill();
+
+  // right side face
+  ctx.fillStyle = colors.side;
+  ctx.beginPath();
+  ctx.moveTo(sx + width,          sy);
+  ctx.lineTo(sx + width + ISO_DX, sy - ISO_DY);
+  ctx.lineTo(sx + width + ISO_DX, sy - ISO_DY + BFH);
+  ctx.lineTo(sx + width,          sy + BFH);
+  ctx.closePath();
+  ctx.fill();
+
+  // subtle edge outline
+  ctx.strokeStyle = 'rgba(0,0,0,0.22)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(sx, sy, width, BFH);
+}
+
+// ─── Particles ───────────────────────────────────────────────────────────────
+function spawnParticles(gx, width, idx, colors) {
+  if (width <= 0) return;
+  const sx = screenX(gx);
+  const sy = screenY(idx);
+  const count = Math.max(6, Math.min(30, Math.floor(width / 3)));
+  for (let i = 0; i < count; i++) {
+    particles.push({
+      x:    sx + Math.random() * width,
+      y:    sy + Math.random() * BFH,
+      vx:   (Math.random() - 0.5) * 8,
+      vy:   -Math.random() * 10 - 2,
+      size: Math.random() * 7 + 2,
+      hue:  colors.raw + (Math.random() - 0.5) * 30,
+      life: 45 + (Math.random() * 35 | 0),
+      maxL: 80,
+    });
+  }
+}
+
+// ─── Core overlap logic ──────────────────────────────────────────────────────
+function calcOverlap(movGx, movWidth, topGx, topWidth) {
+  const ml = movGx,           mr = movGx + movWidth;
+  const tl = topGx,           tr = topGx + topWidth;
+  const oL = Math.max(ml, tl);
+  const oR = Math.min(mr, tr);
+  return { gx: oL, width: oR - oL };
+}
+
+// ─── Block speed ─────────────────────────────────────────────────────────────
+function blockSpeed(level) {
+  return 2.4 + level * 0.17;
+}
+
+// ─── Spawn the next moving block ─────────────────────────────────────────────
+function spawnMoving() {
+  const last  = blocks[blocks.length - 1];
+  const dir   = blocks.length % 2 === 1 ? 1 : -1;
+  const startX = dir > 0
+    ? -CW / 2 - last.width     // enter from left
+    : CW / 2;                  // enter from right
+
+  moving = {
+    gx:    startX,
+    width: last.width,
+    dir,
+    speed: blockSpeed(score),
+  };
+}
+
+// ─── Stack action ─────────────────────────────────────────────────────────────
+function doStack() {
+  if (gameState !== 'play' || !moving) return;
+
+  const top = blocks[blocks.length - 1];
+  const col = blockColors(blocks.length);
+  const { gx: oGx, width: oW } = calcOverlap(
+    moving.gx, moving.width,
+    top.gx, top.width
+  );
+
+  if (oW <= 0) {
+    spawnParticles(moving.gx, moving.width, blocks.length, col);
+    endGame('over');
+    return;
+  }
+
+  // cut left overhang
+  if (moving.gx < oGx) {
+    spawnParticles(moving.gx, oGx - moving.gx, blocks.length, col);
+  }
+  // cut right overhang
+  const movRight = moving.gx + moving.width;
+  const oRight   = oGx + oW;
+  if (movRight > oRight) {
+    spawnParticles(oRight, movRight - oRight, blocks.length, col);
+  }
+
+  // check perfect stack (almost zero offset)
+  const centerOffset = Math.abs(
+    (moving.gx + moving.width / 2) - (top.gx + top.width / 2)
+  );
+  const finalWidth = centerOffset <= PERFECT_ZONE ? top.width : oW;
+  const finalGx    = centerOffset <= PERFECT_ZONE ? top.gx    : oGx;
+
+  blocks.push({ gx: finalGx, width: finalWidth });
+  score++;
+  flashAlpha = 0.22;
+  camYTarget += BLOCK_STEP;
+
+  updateHUD();
+
+  if (score >= MAX_LEVELS) {
+    endGame('win');
+  } else {
+    spawnMoving();
+  }
+}
+
+// ─── Start / end ─────────────────────────────────────────────────────────────
+function startGame() {
+  score      = 0;
+  blocks     = [{ gx: -INITIAL_WIDTH / 2, width: INITIAL_WIDTH }];
+  moving     = null;
+  particles  = [];
+  camY       = 0;
+  camYTarget = 0;
+  flashAlpha = 0;
+  gameState  = 'play';
+  hideBanner();
+  updateHUD();
+  spawnMoving();
+  btn.textContent = '▶ STACK';
+}
+
+function endGame(result) {
+  gameState = result;
+  moving    = null;
+  if (result === 'over') {
+    showBanner(`GAME OVER\n${score} BLOCK${score !== 1 ? 'S' : ''}`, '#ff5050');
+    btn.textContent = '↺ TRY AGAIN';
+  } else {
+    showBanner('🏆 YOU WIN! 🏆\nALL 50 LEVELS!', '#ffd700');
+    btn.textContent = '↺ PLAY AGAIN';
+  }
+}
+
+// ─── HUD ─────────────────────────────────────────────────────────────────────
+function updateHUD() {
+  scoreEl.textContent = score;
+  const lvl = Math.min(score + 1, MAX_LEVELS);
+  levelEl.textContent = `LEVEL ${lvl} / ${MAX_LEVELS}`;
+  progressEl.style.width = `${Math.round((score / MAX_LEVELS) * 100)}%`;
+}
+
+function showBanner(text, color) {
+  banner.innerHTML = text.replace('\n', '<br>');
+  banner.style.color = color;
+  banner.classList.add('show');
+}
+function hideBanner() { banner.classList.remove('show'); }
+
+// ─── Background starfield ────────────────────────────────────────────────────
+const stars = Array.from({ length: 80 }, () => ({
+  x: Math.random() * CW,
+  y: Math.random() * CH,
+  r: Math.random() * 1.5 + 0.3,
+  a: Math.random() * 0.5 + 0.2,
+}));
+
+function drawBackground() {
+  const bg = ctx.createLinearGradient(0, 0, 0, CH);
+  bg.addColorStop(0, '#04041a');
+  bg.addColorStop(1, '#0c0c2e');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, CW, CH);
+
+  for (const s of stars) {
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(255,255,255,${s.a})`;
+    ctx.fill();
+  }
+}
+
+// ─── Render ──────────────────────────────────────────────────────────────────
+function render() {
+  drawBackground();
+
+  // ground glow beneath base block
+  if (blocks.length > 0) {
+    const gy = screenY(0) + BFH + 8;
+    const grd = ctx.createRadialGradient(CW / 2, gy, 5, CW / 2, gy, 130);
+    const h = blockHue(0);
+    grd.addColorStop(0, `hsla(${h},80%,55%,0.18)`);
+    grd.addColorStop(1, 'transparent');
+    ctx.fillStyle = grd;
+    ctx.fillRect(0, gy - 40, CW, 80);
+  }
+
+  // draw all stacked blocks (back to front = bottom to top)
+  for (let i = 0; i < blocks.length; i++) {
+    const sy = screenY(i);
+    if (sy > CH + BFH + ISO_DY + 10 || sy < -(BFH + ISO_DY + 10)) continue;
+    drawBlock3D(blocks[i].gx, blocks[i].width, i, blockColors(i));
+  }
+
+  // draw moving block + alignment guide
+  if (moving) {
+    const idx = blocks.length;
+
+    // subtle guide lines on top of the last stacked block
+    if (blocks.length > 0) {
+      const top = blocks[blocks.length - 1];
+      const gSx = screenX(top.gx) + ISO_DX;
+      const gSy = screenY(idx - 1) - ISO_DY;
+      ctx.fillStyle = 'rgba(255,255,255,0.06)';
+      ctx.fillRect(gSx, gSy, top.width, 3);
+    }
+
+    drawBlock3D(moving.gx, moving.width, idx, blockColors(idx));
+  }
+
+  // particles
+  for (const p of particles) {
+    const alpha = Math.min(p.life / p.maxL, 1);
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = `hsl(${p.hue},85%,60%)`;
+    ctx.fillRect(p.x, p.y, p.size, p.size);
+    ctx.restore();
+  }
+
+  // stack flash
+  if (flashAlpha > 0.001) {
+    ctx.fillStyle = `rgba(255,255,255,${flashAlpha})`;
+    ctx.fillRect(0, 0, CW, CH);
+    flashAlpha *= 0.72;
+  }
+
+  // idle title overlay
+  if (gameState === 'idle') {
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(0, 0, CW, CH);
+  }
+}
+
+// ─── Update ──────────────────────────────────────────────────────────────────
+function update() {
+  // smooth camera scroll
+  camY += (camYTarget - camY) * 0.11;
+
+  if (gameState === 'play' && moving) {
+    moving.gx += moving.dir * moving.speed;
+
+    const sl = screenX(moving.gx);
+    const sr = sl + moving.width;
+    if (sr > CW + 24 && moving.dir > 0) moving.dir = -1;
+    if (sl < -24      && moving.dir < 0) moving.dir =  1;
+  }
+
+  // particles
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x  += p.vx;
+    p.y  += p.vy;
+    p.vy += 0.38;    // gravity
+    p.vx *= 0.97;    // friction
+    p.life--;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
+
+// ─── Loop ────────────────────────────────────────────────────────────────────
+function loop() {
+  update();
+  render();
+  animId = requestAnimationFrame(loop);
+}
+
+// ─── Input ───────────────────────────────────────────────────────────────────
+function handleAction() {
+  if (gameState === 'idle' || gameState === 'over' || gameState === 'win') {
+    startGame();
+  } else if (gameState === 'play') {
+    doStack();
+  }
+}
+
+btn.addEventListener('click', handleAction);
+
+document.addEventListener('keydown', e => {
+  if (e.code === 'Space' || e.code === 'Enter') {
+    e.preventDefault();
+    handleAction();
+  }
+});
+
+canvas.addEventListener('click', () => {
+  if (gameState === 'play') doStack();
+});
+
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  if (gameState === 'play') doStack();
+}, { passive: false });
+
+// ─── Boot ────────────────────────────────────────────────────────────────────
+updateHUD();
+showBanner('CRAZY TOWER\nPress START to play', '#9d7fff');
+loop();
+</script>
+</body>
+</html>
