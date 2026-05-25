@@ -53,6 +53,8 @@
 
     #game-wrap {
       position: relative;
+      width: 600px;
+      height: 740px;
     }
     #canvas {
       display: block;
@@ -69,18 +71,27 @@
     }
     #banner {
       color: #fff;
-      font-size: 2rem;
+      font-size: 1.6rem;
       font-weight: 900;
       text-align: center;
-      line-height: 1.5;
+      line-height: 1.55;
       text-shadow: 0 0 30px currentColor;
       opacity: 0;
       transform: scale(0.75);
       transition: opacity 0.25s ease, transform 0.25s ease;
+      padding: 0 24px;
     }
     #banner.show {
       opacity: 1;
       transform: scale(1);
+    }
+    #flash {
+      position: absolute;
+      inset: 0;
+      background: white;
+      opacity: 0;
+      pointer-events: none;
+      border-radius: 14px;
     }
 
     #stack-btn {
@@ -104,6 +115,12 @@
       transform: scale(0.91);
       box-shadow: 0 2px 12px rgba(139, 40, 200, 0.4);
     }
+    #stack-btn:disabled {
+      opacity: 0.35;
+      cursor: not-allowed;
+      transform: none !important;
+      box-shadow: none;
+    }
 
     #hint {
       margin-top: 8px;
@@ -122,148 +139,323 @@
 </div>
 
 <div id="game-wrap">
-  <canvas id="canvas" width="420" height="520"></canvas>
+  <canvas id="canvas"></canvas>
+  <div id="flash"></div>
   <div id="overlay"><div id="banner"></div></div>
 </div>
 
 <button id="stack-btn">▶ START</button>
 <div id="hint">SPACE / ENTER / TAP</div>
 
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
 <script>
+// ─── Audio ───────────────────────────────────────────────────────────────────
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+function playTone(freq, type, attack, sustain, decay, gainVal = 0.18) {
+  const g  = audioCtx.createGain();
+  const osc = audioCtx.createOscillator();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+  g.gain.setValueAtTime(0, audioCtx.currentTime);
+  g.gain.linearRampToValueAtTime(gainVal, audioCtx.currentTime + attack);
+  g.gain.setValueAtTime(gainVal, audioCtx.currentTime + attack + sustain);
+  g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + attack + sustain + decay);
+  osc.connect(g);
+  g.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + attack + sustain + decay + 0.05);
+}
+
+function sfxStack(score) {
+  // Rising pitch as tower gets taller
+  const freq = 220 + score * 8;
+  playTone(freq,       'sine',   0.005, 0.03, 0.12, 0.22);
+  playTone(freq * 1.5, 'sine',   0.005, 0.01, 0.08, 0.10);
+}
+
+function sfxPerfect() {
+  playTone(880, 'sine', 0.005, 0.05, 0.2, 0.28);
+  playTone(1100, 'sine', 0.01, 0.04, 0.2, 0.18);
+  playTone(1320, 'sine', 0.02, 0.04, 0.25, 0.14);
+}
+
+function sfxMiss() {
+  playTone(120, 'sawtooth', 0.005, 0.05, 0.35, 0.25);
+  playTone(90,  'sawtooth', 0.02,  0.05, 0.4,  0.18);
+}
+
+function sfxWin() {
+  [523, 659, 784, 1047].forEach((f, i) => {
+    setTimeout(() => playTone(f, 'sine', 0.01, 0.1, 0.3, 0.22), i * 120);
+  });
+}
+
+function resumeAudio() { if (audioCtx.state === 'suspended') audioCtx.resume(); }
+
 // ─── Constants ───────────────────────────────────────────────────────────────
 const MAX_LEVELS    = 50;
-const CW            = 420;
-const CH            = 520;
-const BASE_Y        = CH - 72;   // screen-Y of base block's front-face top edge
-const BLOCK_STEP    = 46;        // screen pixels between consecutive block levels
-const BFH           = 28;        // block front-face height (px)
-const ISO_DX        = 20;        // isometric x-depth (right-facing)
-const ISO_DY        = 11;        // isometric y-depth (upward)
-const INITIAL_WIDTH = 186;       // starting block width in game-space px
-const PERFECT_ZONE  = 4;         // ±px for a "perfect" stack (keeps width)
+const CW            = 600;
+const CH            = 740;
+const BLOCK_STEP    = 62;        // world-Y between block levels (BFH + 2 gap)
+const BFH           = 60;        // block height (Y)
+const BLOCK_DEPTH   = 130;       // block depth (Z)
+const INITIAL_WIDTH = 130;       // starting block width (X) — square top face
+const PERFECT_ZONE  = 4;         // ±units for a "perfect" stack (center offset)
+const MIN_CUT       = 10;        // cuts smaller than this snap to perfect
+const MIN_DIMENSION = 50;        // result block can't go below this — prevents pass window collapsing
 
 // ─── DOM refs ────────────────────────────────────────────────────────────────
 const canvas      = document.getElementById('canvas');
-const ctx         = canvas.getContext('2d');
+const flashEl     = document.getElementById('flash');
 const scoreEl     = document.getElementById('score-display');
 const levelEl     = document.getElementById('level-display');
 const progressEl  = document.getElementById('progress-fill');
 const banner      = document.getElementById('banner');
 const btn         = document.getElementById('stack-btn');
 
+// ─── Three.js setup ──────────────────────────────────────────────────────────
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setSize(CW, CH);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x04041a);
+scene.fog = new THREE.FogExp2(0x07071a, 0.00025);
+
+const camera = new THREE.PerspectiveCamera(58, CW / CH, 1, 4000);
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0x9988cc, 0.55);
+scene.add(ambientLight);
+
+const sunLight = new THREE.DirectionalLight(0xffffff, 1.1);
+sunLight.position.set(180, 400, 300);
+sunLight.castShadow = true;
+sunLight.shadow.mapSize.set(1024, 1024);
+sunLight.shadow.camera.near = 10;
+sunLight.shadow.camera.far = 2000;
+sunLight.shadow.camera.left = -300;
+sunLight.shadow.camera.right = 300;
+sunLight.shadow.camera.top = 300;
+sunLight.shadow.camera.bottom = -300;
+scene.add(sunLight);
+
+const rimLight = new THREE.DirectionalLight(0x4433ff, 0.35);
+rimLight.position.set(-1, 0.5, -1).normalize();
+scene.add(rimLight);
+
+// Ground glow point light — follows tower base, color updated each frame
+const glowLight = new THREE.PointLight(0xffffff, 1.2, 350);
+glowLight.position.set(0, -10, 0);
+scene.add(glowLight);
+
+// Stars
+const starGeo = new THREE.BufferGeometry();
+const starPos = new Float32Array(120 * 3);
+for (let i = 0; i < 120; i++) {
+  starPos[i*3]   = (Math.random() - 0.5) * 2400;
+  starPos[i*3+1] = Math.random() * 5000 - 200;
+  starPos[i*3+2] = -400 - Math.random() * 1200;
+}
+starGeo.setAttribute('position', new THREE.BufferAttribute(starPos, 3));
+scene.add(new THREE.Points(starGeo,
+  new THREE.PointsMaterial({ color: 0xffffff, size: 2.5, transparent: true, opacity: 0.55 })));
+
+// Particle system (fixed buffer)
+const MAX_PARTICLES = 400;
+const pGeo    = new THREE.BufferGeometry();
+const pBufPos = new Float32Array(MAX_PARTICLES * 3);
+const pBufCol = new Float32Array(MAX_PARTICLES * 3);
+for (let i = 0; i < MAX_PARTICLES; i++) pBufPos[i*3+1] = -99999;
+pGeo.setAttribute('position', new THREE.BufferAttribute(pBufPos, 3));
+pGeo.setAttribute('color',    new THREE.BufferAttribute(pBufCol, 3));
+const pSystem = new THREE.Points(pGeo,
+  new THREE.PointsMaterial({ size: 5, vertexColors: true, transparent: true, depthWrite: false }));
+scene.add(pSystem);
+
 // ─── Game state ──────────────────────────────────────────────────────────────
-let gameState  = 'idle';   // idle | play | over | win
-let score      = 0;
-let blocks     = [];       // [{gx, width}] — gx is left-edge offset from screen center
-let moving     = null;     // {gx, width, dir, speed}
-let camY       = 0;        // current smooth-camera offset
-let camYTarget = 0;        // target camera offset
-let particles  = [];
-let flashAlpha = 0;
-let animId     = null;
+let gameState     = 'idle';
+let score         = 0;
+let blocks        = [];
+let moving        = null;
+let camWorldY     = 0;
+let camWorldYTgt  = 0;
+let particles     = [];
+let fallingPieces = [];
+let flashAlpha    = 0;
+let resultTime    = 0;
+let blockMeshes   = [];
+let movingMesh    = null;
 
 // ─── Color helpers ───────────────────────────────────────────────────────────
-function blockHue(level) {
-  return (level * 19 + 195) % 360;
+function blockHue(level) { return (level * 19 + 195) % 360; }
+
+function hsl3(h, s, l) {
+  const c = new THREE.Color();
+  c.setHSL(h / 360, s / 100, l / 100);
+  return c;
 }
-function blockColors(level) {
+
+// ─── Block mesh factory ──────────────────────────────────────────────────────
+function makeBlockMesh(gz, depth, gx, width, idx, level) {
   const h = blockHue(level);
-  return {
-    top:   `hsl(${h},85%,70%)`,
-    front: `hsl(${h},80%,54%)`,
-    side:  `hsl(${h},80%,34%)`,
-    raw:   h,
-  };
+  const geo = new THREE.BoxGeometry(width, BFH, depth);
+  const mat = new THREE.MeshPhongMaterial({
+    color:    hsl3(h, 78, 52),
+    emissive: hsl3(h, 60,  8),
+    specular: new THREE.Color(0x333344),
+    shininess: 50,
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.castShadow    = true;
+  mesh.receiveShadow = true;
+  mesh.rotation.y    = -Math.PI / 4;
+  const lxc = gx + width / 2;
+  const lzc = gz + depth / 2;
+  mesh.position.set((lxc - lzc) / Math.SQRT2, idx * BLOCK_STEP + BFH / 2, (lxc + lzc) / Math.SQRT2);
+
+  // Subtle edge outline
+  const edges = new THREE.LineSegments(
+    new THREE.EdgesGeometry(geo),
+    new THREE.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.18 })
+  );
+  mesh.add(edges);
+
+  return mesh;
 }
 
-// ─── Projection helpers ──────────────────────────────────────────────────────
-function screenX(gx)  { return CW / 2 + gx; }
-function screenY(idx) { return BASE_Y - idx * BLOCK_STEP + camY; }
-
-// ─── Draw one 3-D block ──────────────────────────────────────────────────────
-function drawBlock3D(gx, width, idx, colors) {
-  if (width <= 0) return;
-  const sx = screenX(gx);
-  const sy = screenY(idx);
-
-  // front face
-  ctx.fillStyle = colors.front;
-  ctx.fillRect(sx, sy, width, BFH);
-
-  // top face
-  ctx.fillStyle = colors.top;
-  ctx.beginPath();
-  ctx.moveTo(sx,             sy);
-  ctx.lineTo(sx + ISO_DX,    sy - ISO_DY);
-  ctx.lineTo(sx + width + ISO_DX, sy - ISO_DY);
-  ctx.lineTo(sx + width,     sy);
-  ctx.closePath();
-  ctx.fill();
-
-  // right side face
-  ctx.fillStyle = colors.side;
-  ctx.beginPath();
-  ctx.moveTo(sx + width,          sy);
-  ctx.lineTo(sx + width + ISO_DX, sy - ISO_DY);
-  ctx.lineTo(sx + width + ISO_DX, sy - ISO_DY + BFH);
-  ctx.lineTo(sx + width,          sy + BFH);
-  ctx.closePath();
-  ctx.fill();
-
-  // subtle edge outline
-  ctx.strokeStyle = 'rgba(0,0,0,0.22)';
-  ctx.lineWidth = 1;
-  ctx.strokeRect(sx, sy, width, BFH);
+function clearBlockMeshes() {
+  for (const m of blockMeshes) {
+    m.geometry.dispose();
+    m.material.dispose();
+    scene.remove(m);
+  }
+  blockMeshes = [];
+  if (movingMesh) {
+    movingMesh.geometry.dispose();
+    movingMesh.material.dispose();
+    scene.remove(movingMesh);
+    movingMesh = null;
+  }
+  for (const fp of fallingPieces) {
+    fp.mesh.geometry.dispose();
+    fp.mesh.material.dispose();
+    scene.remove(fp.mesh);
+  }
+  fallingPieces = [];
 }
 
 // ─── Particles ───────────────────────────────────────────────────────────────
-function spawnParticles(gx, width, idx, colors) {
-  if (width <= 0) return;
-  const sx = screenX(gx);
-  const sy = screenY(idx);
-  const count = Math.max(6, Math.min(30, Math.floor(width / 3)));
+function spawnParticles(gz, depth, gx, width, idx, hue) {
+  if (depth <= 0 || width <= 0) return;
+  const count = Math.max(6, Math.min(30, Math.floor((depth + width) / 6)));
+  const wy = idx * BLOCK_STEP;
   for (let i = 0; i < count; i++) {
+    const c = new THREE.Color();
+    c.setHSL((hue + (Math.random() - 0.5) * 30) / 360, 0.85, 0.6);
+    const rlx = gx + Math.random() * width;
+    const rlz = gz + Math.random() * depth;
     particles.push({
-      x:    sx + Math.random() * width,
-      y:    sy + Math.random() * BFH,
-      vx:   (Math.random() - 0.5) * 8,
-      vy:   -Math.random() * 10 - 2,
-      size: Math.random() * 7 + 2,
-      hue:  colors.raw + (Math.random() - 0.5) * 30,
+      x: (rlx - rlz) / Math.SQRT2,
+      y: wy + Math.random() * BFH,
+      z: (rlx + rlz) / Math.SQRT2,
+      vx: (Math.random() - 0.5) * 5,
+      vy: Math.random() * 9 + 2,
+      vz: (Math.random() - 0.5) * 5,
+      r: c.r, g: c.g, b: c.b,
       life: 45 + (Math.random() * 35 | 0),
       maxL: 80,
     });
   }
 }
 
+function syncParticleBuffer() {
+  let pi = 0;
+  for (let i = 0; i < particles.length && pi < MAX_PARTICLES; i++, pi++) {
+    const p = particles[i];
+    const a = Math.min(p.life / p.maxL, 1);
+    pBufPos[pi*3]   = p.x;
+    pBufPos[pi*3+1] = p.y;
+    pBufPos[pi*3+2] = p.z;
+    pBufCol[pi*3]   = p.r * a;
+    pBufCol[pi*3+1] = p.g * a;
+    pBufCol[pi*3+2] = p.b * a;
+  }
+  for (; pi < MAX_PARTICLES; pi++) pBufPos[pi*3+1] = -99999;
+  pGeo.attributes.position.needsUpdate = true;
+  pGeo.attributes.color.needsUpdate    = true;
+}
+
+// ─── Falling cut pieces ──────────────────────────────────────────────────────
+function addFallingPiece(gz, depth, gx, width, idx, level) {
+  if (depth <= 0 || width <= 0) return;
+  const h   = blockHue(level);
+  const geo = new THREE.BoxGeometry(width, BFH, depth);
+  const mat = new THREE.MeshPhongMaterial({
+    color:    hsl3(h, 78, 52),
+    emissive: hsl3(h, 60,  8),
+    specular: new THREE.Color(0x333344),
+    shininess: 50,
+    transparent: true,
+    opacity: 1,
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.rotation.y = -Math.PI / 4;
+  const flxc = gx + width / 2;
+  const flzc = gz + depth / 2;
+  mesh.position.set((flxc - flzc) / Math.SQRT2, idx * BLOCK_STEP + BFH / 2, (flxc + flzc) / Math.SQRT2);
+  scene.add(mesh);
+  fallingPieces.push({
+    mesh,
+    vy:   1.5 + Math.random(),
+    spin: (Math.random() - 0.5) * 0.07,
+    life: 75,
+  });
+}
+
 // ─── Core overlap logic ──────────────────────────────────────────────────────
 function calcOverlap(movGx, movWidth, topGx, topWidth) {
-  const ml = movGx,           mr = movGx + movWidth;
-  const tl = topGx,           tr = topGx + topWidth;
-  const oL = Math.max(ml, tl);
-  const oR = Math.min(mr, tr);
+  const oL = Math.max(movGx, topGx);
+  const oR = Math.min(movGx + movWidth, topGx + topWidth);
   return { gx: oL, width: oR - oL };
 }
 
 // ─── Block speed ─────────────────────────────────────────────────────────────
-function blockSpeed(level) {
-  return 2.4 + level * 0.17;
-}
+function blockSpeed(level) { return 2.4 + level * 0.17; }
 
 // ─── Spawn the next moving block ─────────────────────────────────────────────
 function spawnMoving() {
-  const last  = blocks[blocks.length - 1];
-  const dir   = blocks.length % 2 === 1 ? 1 : -1;
-  const startX = dir > 0
-    ? -CW / 2 - last.width     // enter from left
-    : CW / 2;                  // enter from right
+  const last = blocks[blocks.length - 1];
+  const axis = blocks.length % 2 === 1 ? 'z' : 'x';
 
-  moving = {
-    gx:    startX,
-    width: last.width,
-    dir,
-    speed: blockSpeed(score),
-  };
+  if (axis === 'z') {
+    moving = { gz: -CW / 2 - last.depth, depth: last.depth,
+               gx: last.gx, width: last.width, axis, dir: 1, speed: blockSpeed(score) };
+  } else {
+    moving = { gx: -CW / 2 - last.width, width: last.width,
+               gz: last.gz, depth: last.depth, axis, dir: 1, speed: blockSpeed(score) };
+  }
+
+  if (movingMesh) { movingMesh.geometry.dispose(); movingMesh.material.dispose(); scene.remove(movingMesh); }
+  const h = blockHue(blocks.length);
+  const geo = new THREE.BoxGeometry(moving.width, BFH, moving.depth);
+  const mat = new THREE.MeshPhongMaterial({
+    color:    hsl3(h, 78, 52),
+    emissive: hsl3(h, 60,  8),
+    specular: new THREE.Color(0x333344),
+    shininess: 50,
+  });
+  movingMesh = new THREE.Mesh(geo, mat);
+  movingMesh.castShadow    = true;
+  movingMesh.receiveShadow = true;
+  movingMesh.rotation.y    = -Math.PI / 4;
+  movingMesh.add(new THREE.LineSegments(
+    new THREE.EdgesGeometry(geo),
+    new THREE.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.18 })
+  ));
+  scene.add(movingMesh);
 }
 
 // ─── Stack action ─────────────────────────────────────────────────────────────
@@ -271,76 +463,131 @@ function doStack() {
   if (gameState !== 'play' || !moving) return;
 
   const top = blocks[blocks.length - 1];
-  const col = blockColors(blocks.length);
-  const { gx: oGx, width: oW } = calcOverlap(
-    moving.gx, moving.width,
-    top.gx, top.width
-  );
+  const hue = blockHue(blocks.length);
+  let finalGz, finalDepth, finalGx, finalWidth, perfect;
 
-  if (oW <= 0) {
-    spawnParticles(moving.gx, moving.width, blocks.length, col);
-    endGame('over');
-    return;
+  if (moving.axis === 'z') {
+    const { gx: oGz, width: oD } = calcOverlap(moving.gz, moving.depth, top.gz, top.depth);
+    if (oD <= 0) {
+      spawnParticles(moving.gz, moving.depth, moving.gx, moving.width, blocks.length, hue);
+      if (movingMesh) { movingMesh.geometry.dispose(); movingMesh.material.dispose(); scene.remove(movingMesh); movingMesh = null; }
+      sfxMiss(); endGame('over'); return;
+    }
+    const off = Math.abs((moving.gz + moving.depth / 2) - (top.gz + top.depth / 2));
+    perfect = off <= PERFECT_ZONE || (top.depth - oD) < MIN_CUT || oD < MIN_DIMENSION;
+    if (!perfect) {
+      const movFront = moving.gz + moving.depth, oFront = oGz + oD;
+      if (moving.gz < oGz) { const cd = oGz - moving.gz;
+        addFallingPiece(moving.gz, cd, top.gx, top.width, blocks.length, blocks.length);
+        spawnParticles(moving.gz, cd, top.gx, top.width, blocks.length, hue); }
+      if (movFront > oFront) { const cd = movFront - oFront;
+        addFallingPiece(oFront, cd, top.gx, top.width, blocks.length, blocks.length);
+        spawnParticles(oFront, cd, top.gx, top.width, blocks.length, hue); }
+    }
+    finalGz    = perfect ? top.gz    : oGz;
+    finalDepth = perfect ? top.depth : oD;
+    finalGx    = top.gx;  finalWidth = top.width;
+  } else {
+    const { gx: oGx, width: oW } = calcOverlap(moving.gx, moving.width, top.gx, top.width);
+    if (oW <= 0) {
+      spawnParticles(moving.gz, moving.depth, moving.gx, moving.width, blocks.length, hue);
+      if (movingMesh) { movingMesh.geometry.dispose(); movingMesh.material.dispose(); scene.remove(movingMesh); movingMesh = null; }
+      sfxMiss(); endGame('over'); return;
+    }
+    const off = Math.abs((moving.gx + moving.width / 2) - (top.gx + top.width / 2));
+    perfect = off <= PERFECT_ZONE || (top.width - oW) < MIN_CUT || oW < MIN_DIMENSION;
+    if (!perfect) {
+      const movFront = moving.gx + moving.width, oFront = oGx + oW;
+      if (moving.gx < oGx) { const cd = oGx - moving.gx;
+        addFallingPiece(top.gz, top.depth, moving.gx, cd, blocks.length, blocks.length);
+        spawnParticles(top.gz, top.depth, moving.gx, cd, blocks.length, hue); }
+      if (movFront > oFront) { const cd = movFront - oFront;
+        addFallingPiece(top.gz, top.depth, oFront, cd, blocks.length, blocks.length);
+        spawnParticles(top.gz, top.depth, oFront, cd, blocks.length, hue); }
+    }
+    finalGx    = perfect ? top.gx    : oGx;
+    finalWidth = perfect ? top.width : oW;
+    finalGz    = top.gz;  finalDepth = top.depth;
   }
 
-  // cut left overhang
-  if (moving.gx < oGx) {
-    spawnParticles(moving.gx, oGx - moving.gx, blocks.length, col);
-  }
-  // cut right overhang
-  const movRight = moving.gx + moving.width;
-  const oRight   = oGx + oW;
-  if (movRight > oRight) {
-    spawnParticles(oRight, movRight - oRight, blocks.length, col);
-  }
-
-  // check perfect stack (almost zero offset)
-  const centerOffset = Math.abs(
-    (moving.gx + moving.width / 2) - (top.gx + top.width / 2)
-  );
-  const finalWidth = centerOffset <= PERFECT_ZONE ? top.width : oW;
-  const finalGx    = centerOffset <= PERFECT_ZONE ? top.gx    : oGx;
-
-  blocks.push({ gx: finalGx, width: finalWidth });
+  blocks.push({ gz: finalGz, depth: finalDepth, gx: finalGx, width: finalWidth });
   score++;
-  flashAlpha = 0.22;
-  camYTarget += BLOCK_STEP;
+  flashAlpha    = 0.28;
+  camWorldYTgt += BLOCK_STEP;
+  if (perfect) sfxPerfect(); else sfxStack(score);
+
+  if (movingMesh) { movingMesh.geometry.dispose(); movingMesh.material.dispose(); scene.remove(movingMesh); movingMesh = null; }
+  const stackedMesh = makeBlockMesh(finalGz, finalDepth, finalGx, finalWidth, blocks.length - 1, blocks.length - 1);
+  scene.add(stackedMesh);
+  blockMeshes.push(stackedMesh);
 
   updateHUD();
 
-  if (score >= MAX_LEVELS) {
-    endGame('win');
-  } else {
-    spawnMoving();
-  }
+  if (score >= MAX_LEVELS) { sfxWin(); endGame('win'); } else { spawnMoving(); }
 }
 
 // ─── Start / end ─────────────────────────────────────────────────────────────
 function startGame() {
-  score      = 0;
-  blocks     = [{ gx: -INITIAL_WIDTH / 2, width: INITIAL_WIDTH }];
-  moving     = null;
-  particles  = [];
-  camY       = 0;
-  camYTarget = 0;
-  flashAlpha = 0;
-  gameState  = 'play';
+  score        = 0;
+  blocks       = [{ gz: -INITIAL_WIDTH / 2, depth: INITIAL_WIDTH, gx: -INITIAL_WIDTH / 2, width: INITIAL_WIDTH }];
+  moving       = null;
+  particles    = [];
+  camWorldY    = 0;
+  camWorldYTgt = 0;
+  flashAlpha   = 0;
+  gameState    = 'play';
+
+  clearBlockMeshes();
+
+  const baseMesh = makeBlockMesh(-INITIAL_WIDTH / 2, INITIAL_WIDTH, -INITIAL_WIDTH / 2, INITIAL_WIDTH, 0, 0);
+  scene.add(baseMesh);
+  blockMeshes.push(baseMesh);
+
   hideBanner();
   updateHUD();
   spawnMoving();
   btn.textContent = '▶ STACK';
 }
 
+const LOSS_MSGS = [
+  'Gravity 1, You 0.\nRevenge time.',
+  'The block had one job.\nSo did you.',
+  'Close only counts\nin horseshoes and explosions.',
+  'That last block\nwas clearly defective.',
+  'Newton sends\nhis regards.',
+  'The tower misses you\nalready.',
+  'Your hands were\ntoo powerful.',
+  'Almost a skyscraper.\nAlmost.',
+  'The blocks are still\ncheering for you.',
+  'Physics is a suggestion.\nYou just disagreed.',
+  'Rome wasn\'t stacked\nin a day.',
+  'Legendary attempt.\nLegendary.',
+  'One block away\nfrom greatness. Always.',
+  'The floor needed\na friend anyway.',
+  'You are the architect\nof chaos.',
+  'Your reflexes are\njust chronologically creative.',
+  'Next time: peak\nhuman performance.',
+  'The block chose\nchaos. Respect.',
+  'An honest mistake\nby an elite stacker.',
+  'That was clearly\nthe warm-up run.',
+];
+
 function endGame(result) {
-  gameState = result;
-  moving    = null;
+  gameState  = result;
+  moving     = null;
+  resultTime = Date.now();
+  btn.disabled = true;
+
   if (result === 'over') {
-    showBanner(`GAME OVER\n${score} BLOCK${score !== 1 ? 'S' : ''}`, '#ff5050');
+    const msg = LOSS_MSGS[Math.floor(Math.random() * LOSS_MSGS.length)];
+    showBanner(`GAME OVER  ·  ${score} BLOCK${score !== 1 ? 'S' : ''}\n${msg}`, '#ff5050');
     btn.textContent = '↺ TRY AGAIN';
   } else {
     showBanner('🏆 YOU WIN! 🏆\nALL 50 LEVELS!', '#ffd700');
     btn.textContent = '↺ PLAY AGAIN';
   }
+
+  setTimeout(() => { btn.disabled = false; }, 2000);
 }
 
 // ─── HUD ─────────────────────────────────────────────────────────────────────
@@ -352,133 +599,115 @@ function updateHUD() {
 }
 
 function showBanner(text, color) {
-  banner.innerHTML = text.replace('\n', '<br>');
+  banner.innerHTML = text.replace(/\n/g, '<br>');
   banner.style.color = color;
   banner.classList.add('show');
 }
 function hideBanner() { banner.classList.remove('show'); }
 
-// ─── Background starfield ────────────────────────────────────────────────────
-const stars = Array.from({ length: 80 }, () => ({
-  x: Math.random() * CW,
-  y: Math.random() * CH,
-  r: Math.random() * 1.5 + 0.3,
-  a: Math.random() * 0.5 + 0.2,
-}));
+// ─── Update ──────────────────────────────────────────────────────────────────
+function update() {
+  camWorldY += (camWorldYTgt - camWorldY) * 0.11;
 
-function drawBackground() {
-  const bg = ctx.createLinearGradient(0, 0, 0, CH);
-  bg.addColorStop(0, '#04041a');
-  bg.addColorStop(1, '#0c0c2e');
-  ctx.fillStyle = bg;
-  ctx.fillRect(0, 0, CW, CH);
+  if (gameState === 'play' && moving) {
+    const top = blocks[blocks.length - 1];
+    if (moving.axis === 'z') {
+      moving.gz += moving.speed;
+      if (moving.gz >= top.gz + top.depth) {
+        spawnParticles(moving.gz, moving.depth, moving.gx, moving.width, blocks.length, blockHue(blocks.length));
+        if (movingMesh) { movingMesh.geometry.dispose(); movingMesh.material.dispose(); scene.remove(movingMesh); movingMesh = null; }
+        sfxMiss(); endGame('over');
+      }
+    } else {
+      moving.gx += moving.speed;
+      if (moving.gx >= top.gx + top.width) {
+        spawnParticles(moving.gz, moving.depth, moving.gx, moving.width, blocks.length, blockHue(blocks.length));
+        if (movingMesh) { movingMesh.geometry.dispose(); movingMesh.material.dispose(); scene.remove(movingMesh); movingMesh = null; }
+        sfxMiss(); endGame('over');
+      }
+    }
+  }
 
-  for (const s of stars) {
-    ctx.beginPath();
-    ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
-    ctx.fillStyle = `rgba(255,255,255,${s.a})`;
-    ctx.fill();
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx;  p.y += p.vy;  p.z += p.vz;
+    p.vy -= 0.38;
+    p.vx *= 0.97;
+    p.life--;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+
+  for (let i = fallingPieces.length - 1; i >= 0; i--) {
+    const fp = fallingPieces[i];
+    fp.vy -= 0.55;
+    fp.mesh.position.y += fp.vy;
+    fp.mesh.rotation.z += fp.spin;
+    fp.life--;
+    if (fp.life < 25) fp.mesh.material.opacity = fp.life / 25;
+    if (fp.life <= 0) {
+      fp.mesh.geometry.dispose();
+      fp.mesh.material.dispose();
+      scene.remove(fp.mesh);
+      fallingPieces.splice(i, 1);
+    }
+  }
+
+  syncParticleBuffer();
+
+  // Flash CSS overlay
+  if (flashAlpha > 0.001) {
+    flashEl.style.opacity = flashAlpha.toFixed(3);
+    flashAlpha *= 0.72;
+  } else {
+    flashEl.style.opacity = '0';
+    flashAlpha = 0;
   }
 }
 
 // ─── Render ──────────────────────────────────────────────────────────────────
 function render() {
-  drawBackground();
+  // Camera from +X,+Z corner — block's local-Z sweep appears as pure left-right on screen
+  camera.position.set(0, camWorldY + 350, 636);
+  camera.lookAt(0, camWorldY + 50, 0);
 
-  // ground glow beneath base block
-  if (blocks.length > 0) {
-    const gy = screenY(0) + BFH + 8;
-    const grd = ctx.createRadialGradient(CW / 2, gy, 5, CW / 2, gy, 130);
-    const h = blockHue(0);
-    grd.addColorStop(0, `hsla(${h},80%,55%,0.18)`);
-    grd.addColorStop(1, 'transparent');
-    ctx.fillStyle = grd;
-    ctx.fillRect(0, gy - 40, CW, 80);
+  // Ground glow: tint to base block hue
+  const gh = blockHue(0);
+  glowLight.color.setHSL(gh / 360, 0.8, 0.55);
+  glowLight.position.y = camWorldY - 80;
+
+  // Move the sun shadow camera with the tower
+  sunLight.position.set(200, camWorldY + 400, 300);
+  sunLight.target.position.set(0, camWorldY, 0);
+  sunLight.target.updateMatrixWorld();
+
+  // Moving block: travels along block's local Z axis (world: -1/√2, 0, 1/√2)
+  if (movingMesh && moving) {
+    const mlxc = moving.gx + moving.width / 2;
+    const mlzc = moving.gz + moving.depth / 2;
+    movingMesh.position.set(
+      (mlxc - mlzc) / Math.SQRT2,
+      blocks.length * BLOCK_STEP + BFH / 2,
+      (mlxc + mlzc) / Math.SQRT2
+    );
   }
 
-  // draw all stacked blocks (back to front = bottom to top)
-  for (let i = 0; i < blocks.length; i++) {
-    const sy = screenY(i);
-    if (sy > CH + BFH + ISO_DY + 10 || sy < -(BFH + ISO_DY + 10)) continue;
-    drawBlock3D(blocks[i].gx, blocks[i].width, i, blockColors(i));
-  }
-
-  // draw moving block + alignment guide
-  if (moving) {
-    const idx = blocks.length;
-
-    // subtle guide lines on top of the last stacked block
-    if (blocks.length > 0) {
-      const top = blocks[blocks.length - 1];
-      const gSx = screenX(top.gx) + ISO_DX;
-      const gSy = screenY(idx - 1) - ISO_DY;
-      ctx.fillStyle = 'rgba(255,255,255,0.06)';
-      ctx.fillRect(gSx, gSy, top.width, 3);
-    }
-
-    drawBlock3D(moving.gx, moving.width, idx, blockColors(idx));
-  }
-
-  // particles
-  for (const p of particles) {
-    const alpha = Math.min(p.life / p.maxL, 1);
-    ctx.save();
-    ctx.globalAlpha = alpha;
-    ctx.fillStyle = `hsl(${p.hue},85%,60%)`;
-    ctx.fillRect(p.x, p.y, p.size, p.size);
-    ctx.restore();
-  }
-
-  // stack flash
-  if (flashAlpha > 0.001) {
-    ctx.fillStyle = `rgba(255,255,255,${flashAlpha})`;
-    ctx.fillRect(0, 0, CW, CH);
-    flashAlpha *= 0.72;
-  }
-
-  // idle title overlay
-  if (gameState === 'idle') {
-    ctx.fillStyle = 'rgba(0,0,0,0.45)';
-    ctx.fillRect(0, 0, CW, CH);
-  }
-}
-
-// ─── Update ──────────────────────────────────────────────────────────────────
-function update() {
-  // smooth camera scroll
-  camY += (camYTarget - camY) * 0.11;
-
-  if (gameState === 'play' && moving) {
-    moving.gx += moving.dir * moving.speed;
-
-    const sl = screenX(moving.gx);
-    const sr = sl + moving.width;
-    if (sr > CW + 24 && moving.dir > 0) moving.dir = -1;
-    if (sl < -24      && moving.dir < 0) moving.dir =  1;
-  }
-
-  // particles
-  for (let i = particles.length - 1; i >= 0; i--) {
-    const p = particles[i];
-    p.x  += p.vx;
-    p.y  += p.vy;
-    p.vy += 0.38;    // gravity
-    p.vx *= 0.97;    // friction
-    p.life--;
-    if (p.life <= 0) particles.splice(i, 1);
-  }
+  renderer.render(scene, camera);
 }
 
 // ─── Loop ────────────────────────────────────────────────────────────────────
 function loop() {
   update();
   render();
-  animId = requestAnimationFrame(loop);
+  requestAnimationFrame(loop);
 }
 
 // ─── Input ───────────────────────────────────────────────────────────────────
 function handleAction() {
-  if (gameState === 'idle' || gameState === 'over' || gameState === 'win') {
+  resumeAudio();
+  if (gameState === 'idle') {
+    startGame();
+  } else if (gameState === 'over' || gameState === 'win') {
+    if (Date.now() - resultTime < 2000) return;
     startGame();
   } else if (gameState === 'play') {
     doStack();
@@ -494,10 +723,7 @@ document.addEventListener('keydown', e => {
   }
 });
 
-canvas.addEventListener('click', () => {
-  if (gameState === 'play') doStack();
-});
-
+canvas.addEventListener('click', () => { if (gameState === 'play') doStack(); });
 canvas.addEventListener('touchstart', e => {
   e.preventDefault();
   if (gameState === 'play') doStack();

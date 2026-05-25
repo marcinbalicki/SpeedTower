@@ -3,7 +3,7 @@
 // ─── Pure game-logic functions (mirrored from crazy-tower.html) ───────────────
 
 const MAX_LEVELS    = 50;
-const INITIAL_WIDTH = 186;
+const INITIAL_WIDTH = 130;
 const PERFECT_ZONE  = 4;
 
 function calcOverlap(movGx, movWidth, topGx, topWidth) {
