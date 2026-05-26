@@ -474,7 +474,12 @@ function doStack() {
       sfxMiss(); endGame('over'); return;
     }
     const off = Math.abs((moving.gz + moving.depth / 2) - (top.gz + top.depth / 2));
-    perfect = off <= PERFECT_ZONE || (top.depth - oD) < MIN_CUT || oD < MIN_DIMENSION;
+    perfect = off <= PERFECT_ZONE;
+    if (!perfect && moving.gz >= top.gz && oD < moving.depth / 2) {
+      spawnParticles(moving.gz, moving.depth, moving.gx, moving.width, blocks.length, hue);
+      if (movingMesh) { movingMesh.geometry.dispose(); movingMesh.material.dispose(); scene.remove(movingMesh); movingMesh = null; }
+      sfxMiss(); endGame('over'); return;
+    }
     if (!perfect) {
       const movFront = moving.gz + moving.depth, oFront = oGz + oD;
       if (moving.gz < oGz) { const cd = oGz - moving.gz;
@@ -495,7 +500,12 @@ function doStack() {
       sfxMiss(); endGame('over'); return;
     }
     const off = Math.abs((moving.gx + moving.width / 2) - (top.gx + top.width / 2));
-    perfect = off <= PERFECT_ZONE || (top.width - oW) < MIN_CUT || oW < MIN_DIMENSION;
+    perfect = off <= PERFECT_ZONE;
+    if (!perfect && moving.gx >= top.gx && oW < moving.width / 2) {
+      spawnParticles(moving.gz, moving.depth, moving.gx, moving.width, blocks.length, hue);
+      if (movingMesh) { movingMesh.geometry.dispose(); movingMesh.material.dispose(); scene.remove(movingMesh); movingMesh = null; }
+      sfxMiss(); endGame('over'); return;
+    }
     if (!perfect) {
       const movFront = moving.gx + moving.width, oFront = oGx + oW;
       if (moving.gx < oGx) { const cd = oGx - moving.gx;
